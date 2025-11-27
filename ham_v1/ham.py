@@ -5,9 +5,10 @@
 # - Pushes G0 -> G1 via histogram transport + Markov y-transition
 # - Computes (w1_new, r1_new) from firms' FOCs at t=1
 # - Iterates until (w1, r1) = (w1_new, r1_new)  [Rational Expectations fixed point]
+# - Introduces idiosyncratic shocks a la Aiyagari (1994)
 # - Introduces 5% shock, z_1 a la Krusell Smith (1998)
 #
-# Dependencies: numpy, scipy (both available in Colab)
+# Dependencies: numpy, scipy 
 # ============================================================
 
 import numpy as np
