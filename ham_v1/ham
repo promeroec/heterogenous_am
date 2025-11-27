@@ -1,0 +1,275 @@
+# ============================================================
+# Two-period Heterogeneous-Agent (HAM) push-forward with RE on (w1, r1)
+# ------------------------------------------------------------
+# - Solves household policies on a grid taking (w0,r0) and a guess for (w1,r1)
+# - Pushes G0 -> G1 via histogram transport + Markov y-transition
+# - Computes (w1_new, r1_new) from firms' FOCs at t=1
+# - Iterates until (w1, r1) = (w1_new, r1_new)  [Rational Expectations fixed point]
+# - Introduces 5% shock, z_1 a la Krusell Smith (1998)
+#
+# Dependencies: numpy, scipy (both available in Colab)
+# ============================================================
+
+import numpy as np
+from numpy import newaxis as NA
+from scipy.optimize import bisect
+
+# ================
+# 0) Primitives
+# ================
+# Preferences
+sigma = 2.0            # CRRA on consumption
+phi   = 1.0            # disutility weight on labor
+nu    = 1.0            # labor curvature (n^{1+nu}/(1+nu))
+beta  = 0.96
+delta = 0.08
+
+def uc(c):                  # marginal utility of consumption
+    return np.maximum(c, 1e-12)**(-sigma)
+
+# Technology: Cobb–Douglas  Y = z * K^alpha * L^(1-alpha)
+alpha = 0.36
+
+def w_from(K, L, z):
+    # w = MPL = (1-alpha) * z * (K/L)^alpha
+    return (1.0 - alpha) * z * (K / max(L, 1e-12))**alpha
+
+def r_from(K, L, z):
+    # r = MPK - delta = alpha * z * (L/K)^(1-alpha) - delta
+    return alpha * z * (max(L, 1e-12) / max(K, 1e-12))**(1.0 - alpha) - delta
+
+# ==========================
+# 1) States, grids, G0, Pi
+# ==========================
+# Idiosyncratic labor efficiency states and Markov matrix Π(y'|y)
+y_vals = np.array([0.8, 1.2])                         # 2-state demo
+J = len(y_vals)
+Pi = np.array([[0.90, 0.10],
+               [0.10, 0.90]])                         # rows: current y index, cols: next y index
+
+# Asset grid
+A_MIN, A_MAX, M = 0.0, 5.0, 121
+a_grid = np.linspace(A_MIN, A_MAX, M)
+
+# Initial cross-section G0 as histogram mu0[m,j] over (a_m, y_j)
+mu0 = np.ones((M, J))
+mu0 /= mu0.sum()
+
+# Aggregate shocks
+z0, z1 = 1.0, 1.05
+
+# Period-0 prices (treated as given for this exercise)
+w0, r0 = 1.00, 0.02
+
+# Labor bounds (for robust root-finding)
+N_LO, N_HI = 0.0, 1.5
+
+
+# =========================================
+# 2) One-period labor supply solver (FOC)
+# =========================================
+def solve_n_given_prices(y, a, w, r):
+    """
+    Solve phi * n^nu = w*y * [ w*y*n + (1+r)*a ]^(-sigma)
+    Unknown: n in [N_LO, N_HI]. Robust bisection with boundary clamps.
+    """
+    def F(n):
+        c = w*y*n + (1.0 + r)*a
+        return phi * n**nu - w*y * uc(c)
+
+    f_lo, f_hi = F(N_LO + 1e-12), F(N_HI)
+    if f_lo > 0:
+        return N_LO
+    if f_hi < 0:
+        return N_HI
+    return bisect(lambda n: F(n), N_LO + 1e-12, N_HI, xtol=1e-11, maxiter=200)
+
+
+# ====================================================
+# 3) Period-0 problem for (a1, n0) at a given (a0, y0)
+# ====================================================
+def solve_a1_and_n0(a0, j0, w0, r0, w1, r1):
+    """
+    j0 is the *index* of y0 in y_vals to avoid float matching issues.
+    Given (w0,r0; w1,r1), solve:
+        - n0 from intratemporal FOC at t=0 (depends on a1 through c0)
+        - Euler: uc(c0) = beta*(1+r1) * E[ uc(c1(y1)) ]
+    Bisection in a1 with correct monotonicity of the Euler residual.
+    """
+    y0 = y_vals[j0]
+
+    # Ensure c0>0 at the upper n0 bound -> feasible upper bound on a1
+    a1_hi = max(A_MIN, w0*y0*N_HI + (1.0 + r0)*a0 - 1e-12)
+    a1_lo = A_MIN
+
+    def euler_residual(a1):
+        # n0 solves: phi*n0^nu = w0*y0 * uc(c0), c0 = w0*y0*n0 + (1+r0)*a0 - a1
+        def F0(n):
+            c0 = w0*y0*n + (1.0 + r0)*a0 - a1
+            return phi*n**nu - w0*y0*uc(c0)
+
+        f_lo, f_hi = F0(N_LO + 1e-12), F0(N_HI)
+        if f_lo > 0:
+            n0 = N_LO
+        elif f_hi < 0:
+            n0 = N_HI
+        else:
+            n0 = bisect(lambda n: F0(n), N_LO + 1e-12, N_HI, xtol=1e-11, maxiter=200)
+
+        c0 = w0*y0*n0 + (1.0 + r0)*a0 - a1
+        lhs = uc(c0)
+
+        # Period-1: for each y1, solve n1 and compute uc(c1)
+        expected_uc1 = 0.0
+        for k in range(J):
+            y1 = y_vals[k]
+            n1 = solve_n_given_prices(y1, a1, w1, r1)
+            c1 = w1*y1*n1 + (1.0 + r1)*a1
+            expected_uc1 += Pi[j0, k] * uc(c1)
+
+        rhs = beta * (1.0 + r1) * expected_uc1
+        return lhs - rhs, n0
+
+    n0_last = 0.0
+    for _ in range(80):
+        amid = 0.5*(a1_lo + a1_hi)
+        res, n0_at_amid = euler_residual(amid)
+        n0_last = n0_at_amid
+        # If residual > 0: a1 too HIGH (consumption too high) -> decrease a1 (move upper down)
+        if res > 0:
+            a1_hi = amid
+        else:
+            a1_lo = amid
+    a1_star = 0.5*(a1_lo + a1_hi)
+    return a1_star, n0_last
+
+
+# =======================================
+# 4) Policies on the full (a0,y0) grid
+# =======================================
+def compute_policies(a_grid, y_vals, w0, r0, w1, r1):
+    M, J = len(a_grid), len(y_vals)
+    a1_mat = np.zeros((M, J))
+    n0_mat = np.zeros((M, J))
+    for m, a0 in enumerate(a_grid):
+        for j in range(J):
+            a1_star, n0_star = solve_a1_and_n0(a0, j, w0, r0, w1, r1)
+            a1_mat[m, j] = a1_star
+            n0_mat[m, j] = n0_star
+    return a1_mat, n0_mat
+
+
+# ===========================================
+# 5) Push-forward G0->G1 (histogram transport)
+# ===========================================
+def push_forward(mu0, a_grid, a1_mat, Pi):
+    M, J = mu0.shape
+    mu1 = np.zeros_like(mu0)
+
+    # For each current y-state j, move asset mass according to a1 and then apply Π(j->k)
+    for j in range(J):
+        a1 = np.clip(a1_mat[:, j], a_grid[0], a_grid[-1])
+        # right bin index
+        r_idx = np.searchsorted(a_grid, a1, side='right') - 1
+        r_idx = np.clip(r_idx, 0, M-2)
+        aL, aU = a_grid[r_idx], a_grid[r_idx + 1]
+        wU = (a1 - aL) / np.maximum(aU - aL, 1e-14)
+        wL = 1.0 - wU
+
+        for m in range(M):
+            mass = mu0[m, j]
+            if mass == 0.0:
+                continue
+            # distribute over asset bins r and r+1, then over y' with Π
+            for k in range(J):
+                mu1[r_idx[m],   k] += mass * wL[m] * Pi[j, k]
+                mu1[r_idx[m]+1, k] += mass * wU[m] * Pi[j, k]
+
+    # normalize minor numerical drift
+    s = mu1.sum()
+    if s > 0:
+        mu1 /= s
+    return mu1
+
+
+# ==================================================
+# 6) Aggregates & prices at t=1 (given current w1,r1)
+# ==================================================
+def aggregates_and_prices_t1(mu1, a_grid, y_vals, w1, r1, z1):
+    # K1: simple average of a over mu1
+    K1 = (mu1 * a_grid[:, NA]).sum()
+
+    # L1: need n1(a,y; w1,r1). Solve on grid, then average with mu1.
+    M, J = mu1.shape
+    n1_mat = np.zeros_like(mu1)
+    for r in range(M):
+        a = a_grid[r]
+        for k in range(J):
+            y1 = y_vals[k]
+            n1_mat[r, k] = solve_n_given_prices(y1, a, w1, r1)
+
+    L1 = (mu1 * (n1_mat * y_vals[NA, :])).sum()
+
+    # Firms' FOCs -> implied competitive prices
+    w1_new = w_from(K1, L1, z1)
+    r1_new = r_from(K1, L1, z1)
+    return K1, L1, n1_mat, w1_new, r1_new
+
+
+# ==========================================
+# 7) RE fixed point on (w1, r1) — main driver
+# ==========================================
+def solve_RE_two_period(mu0, a_grid, y_vals, w0, r0, z1,
+                        w1_init=1.0, r1_init=0.02,
+                        max_iter=80, damp=0.5, tol=1e-5):
+    """
+    Iterates on (w1,r1) so that the prices implied by G1 (via firm FOCs) equal the prices
+    used inside the household problem.
+    """
+    w1, r1 = w1_init, r1_init
+    for it in range(1, max_iter + 1):
+        # Household policies given current price guess
+        a1_mat, n0_mat = compute_policies(a_grid, y_vals, w0, r0, w1, r1)
+
+        # Push-forward G0 -> G1
+        mu1 = push_forward(mu0, a_grid, a1_mat, Pi)
+
+        # Aggregates, implied prices from firms
+        K1, L1, n1_mat, w1_new, r1_new = aggregates_and_prices_t1(mu1, a_grid, y_vals, w1, r1, z1)
+
+        # Dampened update (helps stability)
+        w1_upd = (1.0 - damp)*w1 + damp*w1_new
+        r1_upd = (1.0 - damp)*r1 + damp*r1_new
+
+        gap = max(abs(w1_upd - w1), abs(r1_upd - r1))
+        w1, r1 = w1_upd, r1_upd
+
+        print(f"Iter {it:02d}: w1={w1:.6f}, r1={r1:.6f}, K1={K1:.6f}, L1={L1:.6f}, gap={gap:.3e}")
+
+        if gap < tol:
+            break
+
+    return {
+        "w0": w0, "r0": r0,
+        "w1": w1, "r1": r1,
+        "a1_mat": a1_mat, "n0_mat": n0_mat, "n1_mat": n1_mat,
+        "mu1": mu1, "K1": K1, "L1": L1, "gap": gap, "iters": it
+    }
+
+
+# =====================
+# 8) Run the solver
+# =====================
+out = solve_RE_two_period(
+    mu0=mu0, a_grid=a_grid, y_vals=y_vals,
+    w0=w0, r0=r0, z1=z1,
+    w1_init=1.0, r1_init=0.02,
+    max_iter=60, damp=0.5, tol=1e-5
+)
+
+print("\n=== Results (RE) ===")
+print("w0, r0:", round(out["w0"], 6), round(out["r0"], 6))
+print("w1, r1:", round(out["w1"], 6), round(out["r1"], 6))
+print("K1, L1:", round(out["K1"], 6), round(out["L1"], 6))
+print("Mass check mu1:", out["mu1"].sum())
+print("Converged in iters:", out["iters"], " | final gap:", out["gap"])
